@@ -1,4 +1,12 @@
 output/audio.mp3
+output/audio.*
+output/video.mp4
+output/video.*
+output/screenshot_*.png
+output/video_title.txt
 .agents/
 run_firebase.bat
 firebase_url.txt
+.env
+*.pptx
+

@@ -1,794 +1,483 @@
 #!/usr/bin/env python3
+"""
+classroom_analyzer_helper.py
+SLC 課例分析輔助腳本
+用法:
+  uv run scripts/classroom_analyzer_helper.py generate-slides --analysis output/analysis.txt --output output/slides.pptx --style learning
+  uv run scripts/classroom_analyzer_helper.py generate-image   --text output/concept.txt   --output output/concept_post.png --style learning
+"""
+
 import argparse
 import sys
 import os
-import json
-import subprocess
+import re
+import textwrap
 from pathlib import Path
 
-def fetch_audio(url: str, output_path: Path) -> int:
-    """Downloads audio from a YouTube/video URL and converts to MP3 using yt-dlp."""
-    print(f"Downloading audio from: {url}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # yt-dlp command to extract audio as mp3
-    cmd = [
-        "yt-dlp",
-        "--remote-components", "ejs:github",
-        "--js-runtimes", "node",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "-o", str(output_path.with_suffix("")),  # yt-dlp appends .mp3 automatically
-        url
-    ]
-    
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        # Check if the output file exists (yt-dlp sometimes names it slightly differently if extension is appended)
-        expected_file = output_path.with_suffix(".mp3")
-        if expected_file.exists() and expected_file != output_path:
-            if output_path.exists():
-                os.remove(output_path)
-            os.rename(expected_file, output_path)
-        
-        if not output_path.exists():
-            # Search for any mp3 in same dir matching the name prefix
-            prefix = output_path.stem
-            for f in output_path.parent.glob(f"{prefix}*.mp3"):
-                os.rename(f, output_path)
-                break
-                
-        if output_path.exists():
-            print(f"[OK] Downloaded and converted audio to: {output_path}")
-            return 0
-        else:
-            print(f"Error: Output file {output_path} was not created.", file=sys.stderr)
-            print(f"yt-dlp stdout: {result.stdout}", file=sys.stderr)
-            print(f"yt-dlp stderr: {result.stderr}", file=sys.stderr)
-            return 1
-    except subprocess.CalledProcessError as e:
-        print(f"Error executing yt-dlp: {e}", file=sys.stderr)
-        print(f"yt-dlp stderr:\n{e.stderr}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        return 1
+# ── 色彩主題 ─────────────────────────────────────────────────────────────────
+THEMES = {
+    "learning": {
+        "bg":    (248, 246, 240),   # 有機茶白
+        "title": (42,  82,  52),    # 深松針綠
+        "body":  (72,  80,  72),    # 溫潤石板灰
+        "accent":(107, 142, 107),   # 淡松針綠
+        "line":  (180, 200, 180),
+    },
+    "pastel": {
+        "bg":    (255, 253, 248),
+        "title": (90,  55,  30),
+        "body":  (40,  40,  40),
+        "accent":(200, 150, 100),
+        "line":  (210, 185, 160),
+    },
+    "blue": {
+        "bg":    (235, 242, 250),
+        "title": (20,  50,  100),
+        "body":  (50,  70,  110),
+        "accent":(70,  120, 200),
+        "line":  (150, 180, 220),
+    },
+    "modern": {
+        "bg":    (245, 245, 245),
+        "title": (20,  20,  20),
+        "body":  (80,  80,  80),
+        "accent":(120, 120, 120),
+        "line":  (180, 180, 180),
+    },
+}
 
-def transcribe_audio(audio_path: Path, output_srt: Path, output_txt: Path, model_name: str, device: str) -> int:
-    """Transcribes audio using faster-whisper and outputs SRT and TXT files."""
-    print(f"Loading Whisper model '{model_name}' on {device}...")
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        print("Error: 'faster-whisper' package is not installed. Please run with 'uv run --with faster-whisper'.", file=sys.stderr)
-        return 1
+# ── 解析分析文件 ──────────────────────────────────────────────────────────────
+def parse_analysis(text: str) -> list[dict]:
+    """
+    解析 analysis.txt。支援兩種格式：
+    格式一：## 第N頁 標題\n描述/詮釋/反思 section
+    格式二：純段落（每個段落自動變成一張投影片）
+    """
+    slides = []
 
-    try:
-        # Load model with fallbacks if medium fails
-        model = None
-        for current_model in [model_name, "small", "base"]:
-            try:
-                model = WhisperModel(current_model, device=device, compute_type="int8")
-                print(f"Successfully loaded model: {current_model}")
-                break
-            except Exception as ex:
-                print(f"Failed to load Whisper model '{current_model}': {ex}. Trying next fallback...", file=sys.stderr)
-        
-        if not model:
-            print("Error: Could not load any Whisper model.", file=sys.stderr)
-            return 1
+    # 嘗試結構化格式
+    slide_pattern = re.compile(
+        r"(?:#{1,3}\s*(?:第\s*\d+\s*[頁張]|Slide\s*\d+)[：:、\s]*)(.+?)$",
+        re.MULTILINE
+    )
+    matches = list(slide_pattern.finditer(text))
 
-        print(f"Transcribing audio file: {audio_path}")
-        segments, info = model.transcribe(
-            str(audio_path),
-            language="zh",
-            beam_size=5,
-            word_timestamps=False
-        )
+    if matches:
+        for i, m in enumerate(matches):
+            title = m.group(1).strip()
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[start:end].strip()
+            slides.append({"title": title, "body": body})
+    else:
+        # 段落模式
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+        for i, p in enumerate(paragraphs):
+            lines = p.splitlines()
+            title = lines[0].lstrip("#").strip() if lines else f"第 {i+1} 頁"
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+            slides.append({"title": title, "body": body})
 
-        srt_lines = []
-        txt_lines = []
-        
-        def format_time(seconds: float) -> str:
-            h = int(seconds // 3600)
-            m = int((seconds % 3600) // 60)
-            s = int(seconds % 60)
-            ms = int((seconds - int(seconds)) * 1000)
-            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    return slides or [{"title": "課例分析", "body": text.strip()}]
 
-        print("Processing segments...")
-        for i, seg in enumerate(segments, 1):
-            start_str = format_time(seg.start)
-            end_str = format_time(seg.end)
-            text = seg.text.strip()
-            
-            srt_lines.append(f"{i}\n{start_str} --> {end_str}\n{text}\n")
-            txt_lines.append(text)
-            
-        output_srt.parent.mkdir(parents=True, exist_ok=True)
-        output_srt.write_text("\n".join(srt_lines), encoding="utf-8")
-        
-        output_txt.parent.mkdir(parents=True, exist_ok=True)
-        output_txt.write_text("\n".join(txt_lines), encoding="utf-8")
-        
-        print(f"[OK] Subtitles written to: {output_srt}")
-        print(f"[OK] Full transcript written to: {output_txt}")
-        return 0
-    except Exception as e:
-        print(f"Error during transcription: {e}", file=sys.stderr)
-        return 1
 
-def generate_slides(analysis_path: Path, output_pptx: Path, style: str) -> int:
-    """Generates a PPTX presentation based on the analysis text file."""
-    print(f"Generating PPTX slides with style '{style}'...")
+# ── 產生 PowerPoint ───────────────────────────────────────────────────────────
+def generate_pptx(slides: list[dict], output_path: str, style: str, images_dir: str | None = None):
     try:
         from pptx import Presentation
-        from pptx.util import Inches, Pt
+        from pptx.util import Inches, Pt, Emu
         from pptx.dml.color import RGBColor
+        from pptx.enum.text import PP_ALIGN
     except ImportError:
-        print("Error: 'python-pptx' package is not installed. Please run with 'uv run --with python-pptx'.", file=sys.stderr)
-        return 1
+        print("[ERROR] python-pptx required: uv pip install python-pptx")
+        sys.exit(1)
 
-    if not analysis_path.exists():
-        print(f"Error: Analysis file {analysis_path} does not exist.", file=sys.stderr)
-        return 1
+    theme = THEMES.get(style, THEMES["learning"])
+    bg_rgb    = RGBColor(*theme["bg"])
+    title_rgb = RGBColor(*theme["title"])
+    body_rgb  = RGBColor(*theme["body"])
+    accent_rgb= RGBColor(*theme["accent"])
 
-    try:
-        analysis_text = analysis_path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Error reading analysis file: {e}", file=sys.stderr)
-        return 1
+    W, H = Inches(13.333), Inches(7.5)  # 16:9
 
-    # Simple outline parser (looks for headings and bullet points)
-    slides_data = []
-    current_slide = None
-    
-    for line in analysis_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("# ") or line.startswith("## ") or line.startswith("### "):
-            # Heading -> New Slide
-            title = line.replace("#", "").strip()
-            if current_slide:
-                slides_data.append(current_slide)
-            current_slide = {"title": title, "bullets": []}
-        elif line.startswith("-") or line.startswith("*") or line.startswith("1."):
-            # Bullet point
-            bullet = line.lstrip("-*1. ").strip()
-            if current_slide:
-                current_slide["bullets"].append(bullet)
-        elif current_slide and len(line) > 10:
-            # Descriptive text as sub-bullet or paragraph
-            current_slide["bullets"].append(line)
-
-    if current_slide:
-        slides_data.append(current_slide)
-
-    # Ensure at least 12 slides by adding dummy slides if necessary, or breaking down slides
-    expanded_slides = []
-    for s in slides_data:
-        if len(s["bullets"]) > 5:
-            # Break down slide into two parts
-            mid = len(s["bullets"]) // 2
-            expanded_slides.append({"title": s["title"] + " (I)", "bullets": s["bullets"][:mid]})
-            expanded_slides.append({"title": s["title"] + " (II)", "bullets": s["bullets"][mid:]})
-        else:
-            expanded_slides.append(s)
-            
-    while len(expanded_slides) < 12:
-        expanded_slides.append({
-            "title": f"學習共同體課例探究與省思 - 專題討論 ({len(expanded_slides) + 1})",
-            "bullets": [
-                "聚焦微觀對話中的聆聽關係建立",
-                "探究協同合作與伸展跳躍學習的脈絡",
-                "思考教師如何建立公共溝通民主語言"
-            ]
-        })
-
-
-def generate_slides(analysis_path: Path, output_pptx: Path, style: str) -> int:
-    """Generates a PPTX presentation based on the analysis text file."""
-    print(f"Generating PPTX slides with style '{style}'...")
-    try:
-        from pptx import Presentation
-        from pptx.util import Inches, Pt
-        from pptx.dml.color import RGBColor
-    except ImportError:
-        print("Error: 'python-pptx' package is not installed. Please run with 'uv run --with python-pptx'.", file=sys.stderr)
-        return 1
-
-    if not analysis_path.exists():
-        print(f"Error: Analysis file {analysis_path} does not exist.", file=sys.stderr)
-        return 1
-
-    try:
-        analysis_text = analysis_path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Error reading analysis file: {e}", file=sys.stderr)
-        return 1
-
-    # Simple outline parser (looks for headings and bullet points)
-    slides_data = []
-    current_slide = None
-    
-    for line in analysis_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("# ") or line.startswith("## ") or line.startswith("### "):
-            # Heading -> New Slide
-            title = line.replace("#", "").strip().replace("**", "").replace("*", "")
-            if current_slide:
-                slides_data.append(current_slide)
-            current_slide = {"title": title, "bullets": []}
-        elif line.startswith("-") or line.startswith("*") or line.startswith("1."):
-            # Bullet point
-            bullet = line.lstrip("-*1. ").strip().replace("**", "").replace("*", "")
-            if current_slide:
-                current_slide["bullets"].append(bullet)
-        elif current_slide and len(line) > 10:
-            # Descriptive text as sub-bullet or paragraph
-            bullet = line.strip().replace("**", "").replace("*", "")
-            current_slide["bullets"].append(bullet)
-
-    if current_slide:
-        slides_data.append(current_slide)
-
-    # Ensure at least 12 slides by adding dummy slides if necessary, or breaking down slides
-    expanded_slides = []
-    for s in slides_data:
-        if len(s["bullets"]) > 5:
-            # Break down slide into two parts
-            mid = len(s["bullets"]) // 2
-            expanded_slides.append({"title": s["title"] + " (I)", "bullets": s["bullets"][:mid]})
-            expanded_slides.append({"title": s["title"] + " (II)", "bullets": s["bullets"][mid:]})
-        else:
-            expanded_slides.append(s)
-            
-    while len(expanded_slides) < 12:
-        expanded_slides.append({
-            "title": f"學習共同體課例探究與省思 - 專題討論 ({len(expanded_slides) + 1})",
-            "bullets": [
-                "聚焦微觀對話中的聆聽關係建立",
-                "探究協同合作與伸展跳躍學習的脈絡",
-                "思考教師如何建立公共溝通民主語言"
-            ]
-        })
-
-    # Create Presentation
     prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
-    
-    # Styles definitions
-    colors = {
-        "pastel": {"bg": RGBColor(245, 245, 240), "title": RGBColor(80, 50, 40), "text": RGBColor(60, 60, 60)},
-        "blue": {"bg": RGBColor(230, 240, 250), "title": RGBColor(10, 40, 80), "text": RGBColor(30, 50, 80)},
-        "modern": {"bg": RGBColor(250, 250, 250), "title": RGBColor(30, 30, 30), "text": RGBColor(80, 80, 80)},
-        "learning": {"bg": RGBColor(238, 242, 235), "title": RGBColor(35, 65, 45), "text": RGBColor(75, 80, 75)}
-    }
-    style_config = colors.get(style, colors["modern"])
+    prs.slide_width  = W
+    prs.slide_height = H
 
-    for i, slide_info in enumerate(expanded_slides[:15]):  # limit to max 15 slides
-        # Use blank layout
-        blank_slide_layout = prs.slide_layouts[6]
-        slide = prs.slides.add_slide(blank_slide_layout)
-        
-        # Apply background color
-        background = slide.background
-        fill = background.fill
-        fill.solid()
-        fill.fore_color.rgb = style_config["bg"]
-        
-        # Title Box (using 16:9 dimensions)
-        txBox = slide.shapes.add_textbox(Inches(0.8), Inches(0.6), Inches(11.733), Inches(1.0))
-        tf = txBox.text_frame
+    blank_layout = prs.slide_layouts[6]  # 空白版型
+
+    def add_slide(title_text: str, body_text: str, img_path: str | None = None):
+        slide = prs.slides.add_slide(blank_layout)
+
+        # 背景色
+        bg = slide.background.fill
+        bg.solid()
+        bg.fore_color.rgb = bg_rgb
+
+        # 裝飾橫線
+        from pptx.util import Pt as UPt
+        line = slide.shapes.add_shape(1, Inches(0.5), Inches(1.5), W - Inches(1), Emu(3))
+        line.fill.background()
+        line.line.color.rgb = RGBColor(*theme["line"])
+        line.line.width = Pt(1)
+
+        # 圖片區域設定
+        has_img = img_path and os.path.exists(img_path)
+        text_w = W - Inches(1) if not has_img else W - Inches(5.5)
+        text_x = Inches(0.5)
+        img_x  = W - Inches(4.8)
+
+        # 標題
+        title_box = slide.shapes.add_textbox(text_x, Inches(0.25), text_w, Inches(1.1))
+        tf = title_box.text_frame
         tf.word_wrap = True
         p = tf.paragraphs[0]
-        p.text = slide_info["title"]
-        p.font.name = "Microsoft JhengHei"
-        
-        # Determine title size based on length to fit on a single line
-        title_text = slide_info["title"]
-        title_len = len(title_text)
-        if title_len <= 15:
-            title_size = 40
-        elif title_len <= 20:
-            title_size = 36
-        else:
-            title_size = 32
-            
-        p.font.size = Pt(title_size)
-        p.font.bold = True
-        p.font.color.rgb = style_config["title"]
-        
-        # Determine if we should insert an illustration on this slide
-        illustration_path = None
-        images_dir = Path("output/images")
-        p_img = images_dir / f"slide_{i+1}.png"
-        if p_img.exists():
-            illustration_path = str(p_img)
+        p.alignment = PP_ALIGN.LEFT
+        run = p.add_run()
+        run.text = title_text
+        run.font.size = Pt(36)
+        run.font.bold = True
+        run.font.color.rgb = title_rgb
+        run.font.name = "微軟正黑體"
 
-        # Content Box Width: default is 11.733 inches if no illustration, or 6.5 inches if illustration
-        content_width = Inches(6.5) if illustration_path else Inches(11.733)
-        
-        # Content Box
-        contentBox = slide.shapes.add_textbox(Inches(0.8), Inches(1.8), content_width, Inches(5.0))
-        c_tf = contentBox.text_frame
-        c_tf.word_wrap = True
-        
-        # Determine text size based on number of bullets and total characters to fit on page
-        bullets = slide_info["bullets"][:6]
-        num_bullets = len(bullets)
-        total_chars = sum(len(b) for b in bullets)
-        
-        if num_bullets <= 3 and total_chars < 150:
-            text_size = 24
-        elif num_bullets <= 4 and total_chars < 220:
-            text_size = 22
-        else:
-            text_size = 20
-            
-        for bullet in bullets:
-            p_b = c_tf.add_paragraph()
-            p_b.text = "• " + bullet
-            p_b.font.name = "Microsoft JhengHei"
-            p_b.font.size = Pt(text_size)
-            p_b.font.color.rgb = style_config["text"]
-            p_b.space_after = Pt(10)
+        # 內文
+        body_box = slide.shapes.add_textbox(text_x, Inches(1.7), text_w, Inches(5.3))
+        tf2 = body_box.text_frame
+        tf2.word_wrap = True
+        for line_text in body_text.split("\n"):
+            p2 = tf2.add_paragraph()
+            p2.alignment = PP_ALIGN.LEFT
+            run2 = p2.add_run()
+            run2.text = line_text
+            run2.font.size = Pt(20)
+            run2.font.color.rgb = body_rgb
+            run2.font.name = "微軟正黑體"
 
-        # Insert illustration if applicable (on the right side: X=8.3, Y=2.0, W=4.2, H=4.2)
-        if illustration_path:
+        # 插圖（若存在）
+        if has_img:
             try:
-                slide.shapes.add_picture(illustration_path, Inches(8.3), Inches(2.0), Inches(4.2), Inches(4.2))
-                print(f"[OK] Inserted illustration {illustration_path} on slide {i+1}")
-            except Exception as img_err:
-                print(f"Error inserting illustration on slide {i+1}: {img_err}", file=sys.stderr)
+                slide.shapes.add_picture(img_path, img_x, Inches(1.3), Inches(4.5), Inches(5.8))
+            except Exception as e:
+                print(f"⚠️ 插圖載入失敗 ({img_path}): {e}")
 
-    output_pptx.parent.mkdir(parents=True, exist_ok=True)
+    # 封面投影片
+    cover = prs.slides.add_slide(blank_layout)
+    bg = cover.background.fill
+    bg.solid()
+    bg.fore_color.rgb = bg_rgb
+
+    cov_title = cover.shapes.add_textbox(Inches(1.5), Inches(2.5), W - Inches(3), Inches(1.5))
+    tf = cov_title.text_frame
+    p = tf.paragraphs[0]
+    from pptx.enum.text import PP_ALIGN
+    p.alignment = PP_ALIGN.CENTER
+    run = p.add_run()
+    run.text = slides[0]["title"] if slides else "課例研究分析"
+    run.font.size = Pt(44)
+    run.font.bold = True
+    run.font.color.rgb = title_rgb
+    run.font.name = "微軟正黑體"
+
+    # 內容投影片
+    for i, s in enumerate(slides):
+        img_path = None
+        if images_dir:
+            candidate = os.path.join(images_dir, f"slide_{i+1}.png")
+            if os.path.exists(candidate):
+                img_path = candidate
+        add_slide(s["title"], s["body"], img_path)
+
+    # 儲存（若被鎖定，自動存為 _copy）
+    out = Path(output_path)
     try:
-        prs.save(str(output_pptx))
-        print(f"[OK] Created PowerPoint slides: {output_pptx}")
+        prs.save(str(out))
+        print(f"[OK] PPTX saved: {out}")
     except PermissionError:
-        output_pptx = output_pptx.parent / (output_pptx.stem + "_copy.pptx")
-        print(f"[WARNING] Permission denied on saving PPTX (is slides.pptx open in PowerPoint?). Saving to copy instead: {output_pptx}", file=sys.stderr)
-        prs.save(str(output_pptx))
-        print(f"[OK] Created PowerPoint slides: {output_pptx}")
-    
-    # Automatically generate corresponding HTML interactive slides
-    output_html = output_pptx.with_suffix(".html")
-    try:
-        generate_html_slides(expanded_slides, output_html, style)
-    except PermissionError:
-        output_html = output_html.parent / (output_html.stem + "_copy.html")
-        print(f"[WARNING] Permission denied on saving HTML. Saving to copy instead: {output_html}", file=sys.stderr)
-        generate_html_slides(expanded_slides, output_html, style)
-    return 0
+        copy_out = out.with_stem(out.stem + "_copy")
+        prs.save(str(copy_out))
+        print(f"[WARN] File locked, saved as: {copy_out}")
+        out = copy_out
+
+    return str(out)
 
 
-def generate_html_slides(expanded_slides: list, output_html: Path, style: str) -> int:
-    """Generates an HTML presentation slide deck."""
-    print(f"Generating HTML slides with style '{style}'...")
-    
-    # Styles definitions in hex
-    colors_hex = {
-        "pastel": {"bg": "#F5F5F0", "title": "#503228", "text": "#3C3C3C"},
-        "blue": {"bg": "#E6F0FA", "title": "#0A2850", "text": "#1E3250"},
-        "modern": {"bg": "#FAFAFA", "title": "#1E1E1E", "text": "#505050"},
-        "learning": {"bg": "#EEF2EB", "title": "#23412D", "text": "#4B504B"}
-    }
-    style_config = colors_hex.get(style, colors_hex["modern"])
-    
-    slides_html_list = []
-    
-    for i, slide_info in enumerate(expanded_slides[:15]):
-        title = slide_info["title"]
-        bullets = slide_info["bullets"][:6]
-        
-        # Check if illustration exists
-        illustration_src = f"./images/slide_{i+1}.png"
-        images_dir = output_html.parent / "images"
-        p_img = images_dir / f"slide_{i+1}.png"
-        
-        has_image = p_img.exists()
-        
-        bullets_html = "\n".join(f"          <li>{b}</li>" for b in bullets)
-        
-        image_html = ""
-        if has_image:
-            image_html = f"""
-        <div class="slide-image">
-          <img src="{illustration_src}" alt="Slide {i+1} Illustration">
-        </div>"""
-            
-        slide_html = f"""
-    <section class="slide" id="slide-{i+1}">
-      <div class="slide-layout">
-        <div class="slide-text">
-          <h2>{title}</h2>
-          <ul>
-{bullets_html}
-          </ul>
-        </div>{image_html}
-      </div>
-    </section>"""
-        slides_html_list.append(slide_html)
-        
-    slides_html = "\n".join(slides_html_list)
-    total_slides = len(expanded_slides[:15])
-    presentation_title = expanded_slides[0]["title"] if expanded_slides else "學習共同體公開課分析"
-    
-    html_content = f"""<!DOCTYPE html>
+# ── 產生 HTML 簡報 ────────────────────────────────────────────────────────────
+def generate_html(slides: list[dict], pptx_path: str, style: str, images_dir: str | None = None):
+    import base64
+
+    theme = THEMES.get(style, THEMES["learning"])
+    r, g, b = theme["bg"]
+    tr, tg, tb = theme["title"]
+    br, bg2, bb = theme["body"]
+    ar, ag, ab = theme["accent"]
+
+    def rgb_to_hex(r, g, b):
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    bg_hex    = rgb_to_hex(*theme["bg"])
+    title_hex = rgb_to_hex(*theme["title"])
+    body_hex  = rgb_to_hex(*theme["body"])
+    accent_hex= rgb_to_hex(*theme["accent"])
+    line_hex  = rgb_to_hex(*theme["line"])
+
+    def img_to_b64(path):
+        try:
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+        except Exception:
+            return None
+
+    slide_html = []
+    for i, s in enumerate(slides):
+        img_b64 = None
+        if images_dir:
+            candidate = os.path.join(images_dir, f"slide_{i+1}.png")
+            if os.path.exists(candidate):
+                img_b64 = img_to_b64(candidate)
+
+        img_section = ""
+        if img_b64:
+            img_section = f'<img class="slide-img" src="data:image/png;base64,{img_b64}" alt="插圖">'
+
+        body_html = "".join(f"<p>{line}</p>" for line in s["body"].split("\n") if line.strip())
+
+        slide_html.append(f"""
+        <div class="slide" id="slide-{i+1}">
+          <div class="slide-content {'has-img' if img_b64 else ''}">
+            <div class="text-area">
+              <h2>{s["title"]}</h2>
+              <div class="body-text">{body_html}</div>
+            </div>
+            {img_section}
+          </div>
+          <div class="slide-number">{i+1} / {len(slides)}</div>
+        </div>
+        """)
+
+    slides_str = "\n".join(slide_html)
+
+    html = f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{presentation_title}</title>
-  <style>
-    :root {{
-      --bg-color: {style_config["bg"]};
-      --title-color: {style_config["title"]};
-      --text-color: {style_config["text"]};
-    }}
-    body {{
-      margin: 0;
-      padding: 0;
-      background-color: var(--bg-color);
-      font-family: 'Microsoft JhengHei', -apple-system, sans-serif;
-      color: var(--text-color);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      overflow: hidden;
-    }}
-    .slides-container {{
-      position: relative;
-      width: 90vw;
-      max-width: 1200px;
-      height: 70vh;
-      min-height: 500px;
-      background: rgba(255, 255, 255, 0.7);
-      backdrop-filter: blur(10px);
-      border-radius: 16px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }}
-    .slide {{
-      display: none;
-      flex: 1;
-      padding: 40px;
-      box-sizing: border-box;
-    }}
-    .slide.active {{
-      display: flex;
-      animation: fadeIn 0.5s ease-in-out forwards;
-    }}
-    @keyframes fadeIn {{
-      from {{ opacity: 0; transform: translateY(10px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    .slide-layout {{
-      display: flex;
-      width: 100%;
-      height: 100%;
-      gap: 40px;
-      align-items: center;
-    }}
-    .slide-text {{
-      flex: 1.2;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-    }}
-    .slide-text h2 {{
-      color: var(--title-color);
-      margin-top: 0;
-      margin-bottom: 24px;
-      font-size: 32px;
-      line-height: 1.3;
-      border-left: 5px solid var(--title-color);
-      padding-left: 15px;
-    }}
-    .slide-text ul {{
-      margin: 0;
-      padding-left: 20px;
-    }}
-    .slide-text li {{
-      font-size: 20px;
-      line-height: 1.8;
-      margin-bottom: 12px;
-      list-style-type: square;
-    }}
-    .slide-image {{
-      flex: 0.8;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100%;
-    }}
-    .slide-image img {{
-      max-width: 100%;
-      max-height: 90%;
-      border-radius: 12px;
-      box-shadow: 0 5px 20px rgba(0,0,0,0.08);
-      object-fit: cover;
-      aspect-ratio: 1;
-    }}
-    .controls {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 20px 40px;
-      background: rgba(255, 255, 255, 0.4);
-      border-top: 1px solid rgba(255, 255, 255, 0.2);
-    }}
-    .btn {{
-      background: var(--title-color);
-      color: var(--bg-color);
-      border: none;
-      padding: 10px 20px;
-      font-size: 16px;
-      font-weight: bold;
-      border-radius: 8px;
-      cursor: pointer;
-      transition: opacity 0.2s, transform 0.1s;
-    }}
-    .btn:hover {{
-      opacity: 0.9;
-    }}
-    .btn:active {{
-      transform: scale(0.98);
-    }}
-    .btn:disabled {{
-      background: #ccc;
-      cursor: not-allowed;
-    }}
-    .progress-bar-container {{
-      flex: 1;
-      height: 8px;
-      background: rgba(0, 0, 0, 0.05);
-      border-radius: 4px;
-      margin: 0 40px;
-      overflow: hidden;
-    }}
-    .progress-bar {{
-      height: 100%;
-      background: var(--title-color);
-      width: 0%;
-      transition: width 0.3s ease;
-    }}
-    .slide-counter {{
-      font-size: 16px;
-      font-weight: bold;
-      color: var(--text-color);
-      min-width: 60px;
-      text-align: right;
-    }}
-    @media (max-width: 768px) {{
-      .slide-layout {{
-        flex-direction: column;
-        overflow-y: auto;
-      }}
-      .slide-image {{
-        height: auto;
-        margin-top: 20px;
-      }}
-      .slide-image img {{
-        max-height: 200px;
-      }}
-    }}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>課例研究分析簡報</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #1a1a2e;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: "微軟正黑體", "Noto Sans TC", sans-serif;
+  }}
+  .slideshow {{
+    width: min(1280px, 95vw);
+    aspect-ratio: 16/9;
+    position: relative;
+    overflow: hidden;
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }}
+  .slide {{
+    position: absolute;
+    inset: 0;
+    background: {bg_hex};
+    display: none;
+    padding: 3% 4%;
+    flex-direction: column;
+    justify-content: flex-start;
+  }}
+  .slide.active {{ display: flex; }}
+  .slide-content {{
+    display: flex;
+    flex-direction: row;
+    gap: 4%;
+    height: 88%;
+    align-items: flex-start;
+  }}
+  .text-area {{
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1.2em;
+  }}
+  h2 {{
+    color: {title_hex};
+    font-size: clamp(1.4rem, 3.2vw, 2.4rem);
+    font-weight: 700;
+    border-bottom: 3px solid {accent_hex};
+    padding-bottom: 0.4em;
+    line-height: 1.3;
+  }}
+  .body-text {{ color: {body_hex}; font-size: clamp(0.9rem, 1.8vw, 1.25rem); line-height: 1.9; }}
+  .body-text p {{ margin-bottom: 0.6em; }}
+  .slide-img {{
+    width: 38%;
+    max-height: 90%;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    flex-shrink: 0;
+  }}
+  .slide-number {{
+    position: absolute;
+    bottom: 1.5%;
+    right: 2%;
+    color: {accent_hex};
+    font-size: clamp(0.7rem, 1.2vw, 0.9rem);
+    opacity: 0.7;
+  }}
+  .controls {{
+    display: flex;
+    gap: 16px;
+    margin-top: 20px;
+    align-items: center;
+  }}
+  button {{
+    background: {accent_hex};
+    color: white;
+    border: none;
+    padding: 10px 28px;
+    border-radius: 6px;
+    font-size: 1rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }}
+  button:hover {{ opacity: 0.8; }}
+  .progress {{
+    color: #aaa;
+    font-family: "微軟正黑體", sans-serif;
+    font-size: 0.95rem;
+    min-width: 80px;
+    text-align: center;
+  }}
+</style>
 </head>
 <body>
-
-  <div class="slides-container">
-{slides_html}
-    
-    <!-- Navigation Controls -->
-    <div class="controls">
-      <button class="btn" id="prev-btn" onclick="changeSlide(-1)">上一頁</button>
-      <div class="progress-bar-container">
-        <div class="progress-bar" id="progress-bar"></div>
-      </div>
-      <button class="btn" id="next-btn" onclick="changeSlide(1)">下一頁</button>
-      <span class="slide-counter" id="slide-counter">1 / {total_slides}</span>
-    </div>
-  </div>
-
-  <script>
-    let currentSlideIndex = 0;
-    const slides = document.querySelectorAll('.slide');
-    const totalSlides = slides.length;
-    const prevBtn = document.getElementById('prev-btn');
-    const nextBtn = document.getElementById('next-btn');
-    const progressBar = document.getElementById('progress-bar');
-    const slideCounter = document.getElementById('slide-counter');
-
-    function showSlide(index) {{
-      slides.forEach((slide, i) => {{
-        slide.classList.toggle('active', i === index);
-      }});
-      
-      currentSlideIndex = index;
-      
-      // Update buttons
-      prevBtn.disabled = index === 0;
-      nextBtn.disabled = index === totalSlides - 1;
-      
-      // Update progress bar
-      const progressPercent = ((index + 1) / totalSlides) * 100;
-      progressBar.style.width = `${{progressPercent}}%`;
-      
-      // Update counter
-      slideCounter.innerText = `${{index + 1}} / ${{totalSlides}}`;
-    }}
-
-    function changeSlide(direction) {{
-      let targetIndex = currentSlideIndex + direction;
-      if (targetIndex >= 0 && targetIndex < totalSlides) {{
-        showSlide(targetIndex);
-      }}
-    }}
-
-    // Keyboard navigation
-    document.addEventListener('keydown', (e) => {{
-      if (e.key === 'ArrowRight' || e.key === ' ') {{
-        changeSlide(1);
-      }} else if (e.key === 'ArrowLeft') {{
-        changeSlide(-1);
-      }}
-    }});
-
-    // Initialize first slide
-    showSlide(0);
-  </script>
+<div class="slideshow" id="slideshow">
+{slides_str}
+</div>
+<div class="controls">
+  <button onclick="changeSlide(-1)">◀ 上一頁</button>
+  <span class="progress" id="progress">1 / {len(slides)}</span>
+  <button onclick="changeSlide(1)">下一頁 ▶</button>
+</div>
+<script>
+  let cur = 0;
+  const slides = document.querySelectorAll('.slide');
+  function show(n) {{
+    slides[cur].classList.remove('active');
+    cur = (n + slides.length) % slides.length;
+    slides[cur].classList.add('active');
+    document.getElementById('progress').textContent = (cur+1) + ' / ' + slides.length;
+  }}
+  function changeSlide(d) {{ show(cur + d); }}
+  document.addEventListener('keydown', e => {{
+    if (e.key === 'ArrowRight' || e.key === ' ') changeSlide(1);
+    if (e.key === 'ArrowLeft') changeSlide(-1);
+  }});
+  slides[0].classList.add('active');
+</script>
 </body>
-</html>
-"""
-    output_html.parent.mkdir(parents=True, exist_ok=True)
-    output_html.write_text(html_content, encoding="utf-8")
-    print(f"[OK] Created HTML slides: {output_html}")
-    return 0
+</html>"""
+
+    html_path = Path(pptx_path).with_suffix(".html")
+    try:
+        html_path.write_text(html, encoding="utf-8")
+        print(f"[OK] HTML saved: {html_path}")
+    except Exception as e:
+        print(f"[WARN] HTML save failed: {e}")
 
 
-def generate_image(text_path: Path, output_png: Path, bg_color: str) -> int:
-    """Generates a FB/IG concept image using Pillow."""
-    print(f"Generating concept image...")
+# ── 產生社群概念圖 ────────────────────────────────────────────────────────────
+def generate_image_cmd(text_path: str, output_path: str, style: str):
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
-        print("Error: 'Pillow' package is not installed. Please run with 'uv run --with pillow'.", file=sys.stderr)
-        return 1
+        print("[ERROR] Pillow required: uv pip install Pillow")
+        sys.exit(1)
 
-    if not text_path.exists():
-        print(f"Error: Text file {text_path} does not exist.", file=sys.stderr)
-        return 1
+    theme = THEMES.get(style, THEMES["learning"])
+    W, H = 1200, 630
 
-    try:
-        lines = [line.strip() for line in text_path.read_text(encoding="utf-8").splitlines() if line.strip()][:8]
-    except Exception as e:
-        print(f"Error reading text: {e}", file=sys.stderr)
-        return 1
-
-    # Image setup: square for IG/FB
-    width, height = 1080, 1080
-    bg_colors = {
-        "pastel": (245, 245, 240),
-        "blue": (230, 240, 250),
-        "modern": (250, 250, 250),
-        "dark": (30, 30, 35),
-        "learning": (238, 242, 235)
-    }
-    text_colors = {
-        "pastel": (80, 50, 40),
-        "blue": (10, 40, 80),
-        "modern": (30, 30, 30),
-        "dark": (240, 240, 245),
-        "learning": (35, 65, 45)
-    }
-    
-    bg = bg_colors.get(bg_color, bg_colors["modern"])
-    text_color = text_colors.get(bg_color, text_colors["modern"])
-    
-    img = Image.new("RGB", (width, height), color=bg)
+    img = Image.new("RGB", (W, H), color=theme["bg"])
     draw = ImageDraw.Draw(img)
-    
-    # Font setup
-    fonts_to_try = [
-        "msjh.ttc",            # Microsoft JhengHei on Windows
-        "Microsoft JhengHei.ttf",
-        "msyh.ttc",            # Microsoft YaHei
-        "arial.ttf"
-    ]
-    font_title = None
-    font_body = None
-    
-    for f_name in fonts_to_try:
-        try:
-            font_title = ImageFont.truetype(f_name, 48)
-            font_body = ImageFont.truetype(f_name, 28)
+
+    content = Path(text_path).read_text(encoding="utf-8")
+    lines = content.strip().splitlines()
+
+    # 嘗試載入字型（fallback 到 default）
+    try:
+        title_font = ImageFont.truetype("C:/Windows/Fonts/msjhbd.ttc", 48)
+        body_font  = ImageFont.truetype("C:/Windows/Fonts/msjh.ttc", 28)
+    except Exception:
+        title_font = ImageFont.load_default()
+        body_font  = ImageFont.load_default()
+
+    y = 60
+    if lines:
+        draw.text((80, y), lines[0], fill=theme["title"], font=title_font)
+        y += 80
+
+    for line in lines[1:]:
+        if y > H - 60:
             break
-        except IOError:
-            continue
-            
-    if not font_title:
-        # Fallback to default
-        font_title = ImageFont.load_default()
-        font_body = ImageFont.load_default()
+        wrapped = textwrap.fill(line, width=38)
+        for wl in wrapped.splitlines():
+            draw.text((80, y), wl, fill=theme["body"], font=body_font)
+            y += 44
 
-    # Draw card outline
-    draw.rectangle([60, 60, width - 60, height - 60], outline=text_color, width=3)
-    
-    # Draw Title
-    title = "學習共同體 • 課堂核心概念"
-    draw.text((100, 120), title, fill=text_color, font=font_title)
-    draw.line([100, 190, width - 100, 190], fill=text_color, width=2)
-    
-    # Draw Bullet Points
-    y_offset = 240
-    for line in lines:
-        if len(line) > 35:
-            line = line[:35] + "..."
-        draw.text((120, y_offset), "★ " + line, fill=text_color, font=font_body)
-        y_offset += 75
-        
-    # Draw Footer
-    footer = "光復國小 數學學科公開課 課例研究成果分享"
-    draw.text((100, height - 120), footer, fill=text_color, font=font_body)
+    # 裝飾線
+    draw.rectangle([60, 130, 60, H - 60], fill=theme["accent"], width=4)
 
-    output_png.parent.mkdir(parents=True, exist_ok=True)
-    img.save(str(output_png))
-    print(f"[OK] Generated concept image: {output_png}")
-    return 0
+    img.save(output_path)
+    print(f"[OK] Concept image saved: {output_path}")
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Classroom Video Analyzer Helper CLI")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    
-    # fetch-audio
-    p_fetch = subparsers.add_parser("fetch-audio", help="Fetch audio track from URL as mp3")
-    p_fetch.add_argument("url", type=str, help="YouTube or video URL")
-    p_fetch.add_argument("--output", type=Path, required=True, help="Destination mp3 file path")
-    
-    # transcribe
-    p_trans = subparsers.add_parser("transcribe", help="Transcribe audio to SRT/TXT using Whisper")
-    p_trans.add_argument("audio", type=Path, help="Source audio file path")
-    p_trans.add_argument("--output-srt", type=Path, required=True, help="Destination SRT subtitle path")
-    p_trans.add_argument("--output-txt", type=Path, required=True, help="Destination TXT transcript path")
-    p_trans.add_argument("--model", type=str, default="medium", help="Whisper model size")
-    p_trans.add_argument("--device", type=str, default="cpu", help="Computation device (cpu or cuda)")
-    
+
+# ── CLI 主入口 ────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="SLC 課例分析輔助工具")
+    sub = parser.add_subparsers(dest="cmd")
+
     # generate-slides
-    p_slides = subparsers.add_parser("generate-slides", help="Generate PPTX slides from analysis text")
-    p_slides.add_argument("--analysis", type=Path, required=True, help="Path to analysis markdown/text file")
-    p_slides.add_argument("--output", type=Path, required=True, help="Destination PPTX file path")
-    p_slides.add_argument("--style", type=str, default="modern", choices=["modern", "pastel", "blue", "learning"], help="Slides color theme")
-    
+    p_slides = sub.add_parser("generate-slides")
+    p_slides.add_argument("--analysis", required=True)
+    p_slides.add_argument("--output",   required=True)
+    p_slides.add_argument("--style",    default="learning", choices=THEMES.keys())
+    p_slides.add_argument("--images",   default=None, help="插圖目錄（如 output/images）")
+
     # generate-image
-    p_image = subparsers.add_parser("generate-image", help="Generate social media conceptual image")
-    p_image.add_argument("--text", type=Path, required=True, help="Path to text summary file")
-    p_image.add_argument("--output", type=Path, required=True, help="Destination PNG file path")
-    p_image.add_argument("--style", type=str, default="modern", choices=["modern", "pastel", "blue", "dark", "learning"], help="Image color style")
-    
+    p_img = sub.add_parser("generate-image")
+    p_img.add_argument("--text",   required=True)
+    p_img.add_argument("--output", required=True)
+    p_img.add_argument("--style",  default="learning", choices=THEMES.keys())
+
     args = parser.parse_args()
-    
-    if args.command == "fetch-audio":
-        return fetch_audio(args.url, args.output)
-    elif args.command == "transcribe":
-        return transcribe_audio(args.audio, args.output_srt, args.output_txt, args.model, args.device)
-    elif args.command == "generate-slides":
-        return generate_slides(args.analysis, args.output, args.style)
-    elif args.command == "generate-image":
-        return generate_image(args.text, args.output, args.style)
-        
-    return 0
+
+    if args.cmd == "generate-slides":
+        text = Path(args.analysis).read_text(encoding="utf-8")
+        slides = parse_analysis(text)
+        print(f"[INFO] Parsed {len(slides)} slides")
+
+        # 自動偵測 images 目錄
+        images_dir = args.images
+        if not images_dir:
+            candidate = str(Path(args.output).parent / "images")
+            if os.path.isdir(candidate):
+                images_dir = candidate
+
+        pptx_path = generate_pptx(slides, args.output, args.style, images_dir)
+        generate_html(slides, pptx_path, args.style, images_dir)
+
+    elif args.cmd == "generate-image":
+        generate_image_cmd(args.text, args.output, args.style)
+
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
