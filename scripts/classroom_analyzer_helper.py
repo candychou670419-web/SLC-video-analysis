@@ -303,6 +303,7 @@ def generate_html(slides: list[dict], pptx_path: str, style: str, images_dir: st
     display: flex;
     flex-direction: column;
     gap: 1.2em;
+    min-height: 0;
   }}
   h2 {{
     color: {title_hex};
@@ -312,7 +313,14 @@ def generate_html(slides: list[dict], pptx_path: str, style: str, images_dir: st
     padding-bottom: 0.4em;
     line-height: 1.3;
   }}
-  .body-text {{ color: {body_hex}; font-size: clamp(0.9rem, 1.8vw, 1.25rem); line-height: 1.9; }}
+  .body-text {{
+    color: {body_hex};
+    font-size: clamp(0.9rem, 1.8vw, 1.25rem);
+    line-height: 1.9;
+    overflow-y: auto;
+    max-height: 100%;
+    padding-right: 5px;
+  }}
   .body-text p {{ margin-bottom: 0.6em; }}
   .slide-img {{
     width: 38%;
@@ -322,6 +330,44 @@ def generate_html(slides: list[dict], pptx_path: str, style: str, images_dir: st
     box-shadow: 0 4px 20px rgba(0,0,0,0.15);
     flex-shrink: 0;
   }}
+
+  /* RWD 手機版與窄螢幕優化 */
+  @media (max-width: 768px) {{
+    .slideshow {{
+      aspect-ratio: auto;
+      height: 75vh;
+      min-height: 480px;
+    }}
+    .slide {{
+      padding: 15px 15px 35px 15px;
+    }}
+    .slide-content {{
+      flex-direction: column;
+      gap: 15px;
+      height: 92%;
+    }}
+    .text-area {{
+      flex: none;
+      width: 100%;
+      height: auto;
+      max-height: 100%;
+    }}
+    h2 {{
+      font-size: 1.25rem;
+      padding-bottom: 0.2em;
+    }}
+    .body-text {{
+      font-size: 0.95rem;
+      line-height: 1.6;
+      max-height: 250px;
+    }}
+    .slide-img {{
+      width: 100%;
+      max-height: 180px;
+      margin-top: 5px;
+    }}
+  }}
+
   .slide-number {{
     position: absolute;
     bottom: 1.5%;
