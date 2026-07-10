@@ -335,36 +335,45 @@ def generate_html(slides: list[dict], pptx_path: str, style: str, images_dir: st
   @media (max-width: 768px) {{
     .slideshow {{
       aspect-ratio: auto;
-      height: 75vh;
+      height: 82vh;
       min-height: 480px;
     }}
     .slide {{
-      padding: 15px 15px 35px 15px;
+      padding: 12px 12px 30px 12px;
     }}
     .slide-content {{
       flex-direction: column;
-      gap: 15px;
-      height: 92%;
+      gap: 8px;
+      height: 94%;
     }}
     .text-area {{
-      flex: none;
+      flex: 1;
       width: 100%;
-      height: auto;
-      max-height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5em;
     }}
     h2 {{
-      font-size: 1.25rem;
-      padding-bottom: 0.2em;
+      font-size: 1.15rem;
+      padding-bottom: 0.1em;
+      border-bottom-width: 2px;
+      line-height: 1.2;
     }}
     .body-text {{
-      font-size: 0.95rem;
-      line-height: 1.6;
-      max-height: 250px;
+      font-size: 0.76rem;
+      line-height: 1.35;
+      max-height: none;
+      overflow-y: auto;
+    }}
+    .body-text p {{
+      margin-bottom: 0.3em;
     }}
     .slide-img {{
-      width: 100%;
-      max-height: 180px;
-      margin-top: 5px;
+      width: auto;
+      align-self: center;
+      max-height: 110px;
+      margin-top: 2px;
     }}
   }}
 
